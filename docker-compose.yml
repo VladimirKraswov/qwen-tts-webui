@@ -1,21 +1,39 @@
 services:
   tts:
-    build: ./backend
-    runtime: nvidia
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     environment:
-      - NVIDIA_VISIBLE_DEVICES=all
-      - TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-      - TTS_DEVICE=cuda:0
-      - TTS_DTYPE=bfloat16
-      - TTS_STREAM_EMIT_FRAMES=6
-      - TTS_STREAM_DECODE_WINDOW=72
+      APP_NAME: Qwen TTS Web UI
+      TTS_MODEL: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+      TTS_DEVICE: cuda:0
+      TTS_DTYPE: bfloat16
+      TTS_STREAM_EMIT_FRAMES: 6
+      TTS_STREAM_DECODE_WINDOW: 72
+      TTS_DEFAULT_VOICE: Vivian
+      TTS_DEFAULT_LANGUAGE: Russian
+      TTS_MAX_TEXT_LENGTH: 8000
     ports:
       - "8000:8000"
     volumes:
-      - ./backend:/app
+      - ./backend:/app/backend
       - ./frontend:/app/frontend
       - tts-cache:/root/.cache/huggingface
       - book-uploads:/tmp/book_uploads
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
 volumes:
   tts-cache:
   book-uploads:

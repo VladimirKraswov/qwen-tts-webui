@@ -1,9 +1,7 @@
 fastapi==0.110.0
 uvicorn[standard]==0.27.1
 python-multipart==0.0.9
-torch==2.5.1+cu124 --index-url https://download.pytorch.org/whl/cu124
 transformers==4.46.3
-qwen-tts
 ctranslate2
 faster-whisper
 pyyaml

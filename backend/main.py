@@ -1,21 +1,81 @@
-import os
-import logging
-import uuid
 import asyncio
+import json
+import logging
+import shutil
+import uuid
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
-from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from typing import Literal
+from zipfile import ZIP_DEFLATED, ZipFile
+
 import aiofiles
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
-from tts_engine import engine, VOICES, SAMPLE_RATE
+from .config import (
+    ALLOWED_AUDIO_FORMATS,
+    APP_NAME,
+    APP_VERSION,
+    BOOK_MAX_FILE_SIZE_MB,
+    BOOK_MAX_PARAGRAPHS,
+    BOOK_PREVIEW_SEGMENTS,
+    BOOK_UPLOAD_DIR,
+    DEFAULT_LANGUAGE,
+    DEFAULT_VOICE,
+    FRONTEND_DIR,
+    MAX_TTS_TEXT_LENGTH,
+    SAMPLE_RATE,
+    SUPPORTED_LANGUAGES,
+    VOICES,
+)
+from .tts_engine import engine
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Qwen TTS Web UI", version="1.0")
+
+class TTSRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=MAX_TTS_TEXT_LENGTH)
+    voice: str = DEFAULT_VOICE
+    language: str = DEFAULT_LANGUAGE
+    response_format: Literal["mp3", "wav", "pcm"] = "mp3"
+    stream: bool = False
+    instruct: str | None = Field(default=None, max_length=250)
+
+
+class BookGenerationRequest(BaseModel):
+    voice: str = DEFAULT_VOICE
+    language: str = DEFAULT_LANGUAGE
+    response_format: Literal["mp3", "wav"] = "mp3"
+    instruct: str | None = Field(default=None, max_length=250)
+
+
+book_tasks: dict[str, asyncio.Task] = {}
+book_generation_lock = asyncio.Lock()
+
+
+async def _warm_model() -> None:
+    try:
+        await asyncio.to_thread(engine.load_model)
+    except Exception:
+        logger.warning("Model warmup failed during startup; the API will retry on demand.", exc_info=True)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    warmup_task = asyncio.create_task(_warm_model())
+    try:
+        yield
+    finally:
+        warmup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await warmup_task
+
+
+app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,128 +84,313 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-frontend_path = Path(__file__).parent / "frontend"
-if frontend_path.exists():
-    app.mount("/static", StaticFiles(directory=str(frontend_path)), name="static")
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
-class TTSRequest(BaseModel):
-    text: str
-    voice: str = "Vivian"
-    language: str = "Russian"
-    response_format: str = "mp3"
-    stream: bool = False
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(asyncio.to_thread(engine.load_model))
+
+def _job_dir(job_id: str) -> Path:
+    return BOOK_UPLOAD_DIR / job_id
+
+
+def _job_meta_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "job.json"
+
+
+def _job_output_dir(job_id: str) -> Path:
+    return _job_dir(job_id) / "audio"
+
+
+def _write_job_meta(job_id: str, payload: dict) -> None:
+    _job_dir(job_id).mkdir(parents=True, exist_ok=True)
+    _job_meta_path(job_id).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _read_job_meta(job_id: str) -> dict:
+    path = _job_meta_path(job_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _serialize_job(job_id: str) -> dict:
+    meta = _read_job_meta(job_id)
+    zip_path = _job_dir(job_id) / "audio_bundle.zip"
+    meta["download_url"] = f"/api/books/{job_id}/download" if zip_path.exists() else None
+    meta["files"] = sorted([item.name for item in _job_output_dir(job_id).glob("*")]) if _job_output_dir(job_id).exists() else []
+    return meta
+
+
+def _validate_voice_and_language(voice: str, language: str) -> None:
+    if voice not in VOICES:
+        raise HTTPException(status_code=400, detail="Некорректный голос")
+    if language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=400, detail="Некорректный язык")
+
 
 @app.get("/")
 async def root():
-    return {"message": "Qwen TTS Web UI backend. Visit /static/index.html for UI."}
+    index_path = FRONTEND_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(index_path)
+    return JSONResponse({"message": f"{APP_NAME} backend is running"})
 
+
+@app.get("/api/health")
+@app.get("/health")
+async def health() -> dict:
+    return {"ok": True, "engine": engine.status()}
+
+
+@app.get("/api/voices")
 @app.get("/voices")
-async def get_voices():
-    return {"voices": VOICES}
+async def get_voices() -> dict:
+    return {
+        "voices": VOICES,
+        "default_voice": DEFAULT_VOICE,
+        "languages": SUPPORTED_LANGUAGES,
+        "default_language": DEFAULT_LANGUAGE,
+    }
 
+
+@app.post("/api/audio/speech")
 @app.post("/v1/audio/speech")
 async def generate_speech(request: TTSRequest):
-    if request.voice not in VOICES:
-        raise HTTPException(status_code=400, detail="Invalid voice")
-    try:
-        audio_bytes = await asyncio.to_thread(
-            engine.generate_audio,
-            request.text,
-            request.voice,
-            request.language
-        )
-        media_type = "audio/mpeg" if request.response_format == "mp3" else "audio/wav"
-        return StreamingResponse(
-            iter([audio_bytes]),
-            media_type=media_type,
-            headers={"Content-Disposition": f"attachment; filename=speech.{request.response_format}"}
-        )
-    except Exception as e:
-        logger.exception("Error generating speech")
-        raise HTTPException(status_code=500, detail=str(e))
+    _validate_voice_and_language(request.voice, request.language)
+    if request.response_format not in {"mp3", "wav"}:
+        raise HTTPException(status_code=400, detail="Поддерживаются только mp3 и wav")
 
+    try:
+        audio_bytes = await engine.generate_audio(
+            text=request.text,
+            voice=request.voice,
+            language=request.language,
+            response_format=request.response_format,
+            instruct=request.instruct,
+        )
+    except Exception as exc:  # pragma: no cover - depends on runtime/model
+        logger.exception("Speech generation failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    media_type = "audio/mpeg" if request.response_format == "mp3" else "audio/wav"
+    filename = f"speech.{request.response_format}"
+    return StreamingResponse(
+        iter([audio_bytes]),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/audio/stream")
 @app.post("/v1/audio/stream")
 async def stream_speech(request: TTSRequest):
+    _validate_voice_and_language(request.voice, request.language)
     if not request.stream:
         return await generate_speech(request)
-    if request.voice not in VOICES:
-        raise HTTPException(status_code=400, detail="Invalid voice")
-    async def generate():
+
+    async def generator():
         try:
-            async for chunk in engine.stream_generate(request.text, request.voice, request.language):
+            async for chunk in engine.stream_generate(
+                text=request.text,
+                voice=request.voice,
+                language=request.language,
+                instruct=request.instruct,
+            ):
                 yield chunk
-        except Exception as e:
-            logger.exception("Streaming error")
+        except Exception as exc:  # pragma: no cover - depends on runtime/model
+            logger.exception("Stream generation failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     return StreamingResponse(
-        generate(),
+        generator(),
         media_type="audio/L16",
         headers={
             "Content-Type": "audio/L16",
             "X-Sample-Rate": str(SAMPLE_RATE),
-            "X-Channels": "1"
-        }
+            "X-Channels": "1",
+        },
     )
 
-BOOK_UPLOAD_DIR = Path("/tmp/book_uploads")
-BOOK_UPLOAD_DIR.mkdir(exist_ok=True)
 
+@app.post("/api/books/upload")
 @app.post("/upload_text")
-async def upload_text(file: UploadFile = File(...)):
-    if not file.filename.endswith(".txt"):
-        raise HTTPException(400, "Only .txt files are supported for now")
+async def upload_book_text(file: UploadFile = File(...)):
+    if not file.filename or not file.filename.lower().endswith(".txt"):
+        raise HTTPException(status_code=400, detail="Поддерживаются только .txt файлы")
+
     content = await file.read()
-    text = content.decode("utf-8")
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    max_bytes = BOOK_MAX_FILE_SIZE_MB * 1024 * 1024
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"Файл слишком большой. Лимит: {BOOK_MAX_FILE_SIZE_MB} MB")
+
+    text = content.decode("utf-8-sig", errors="replace")
+    paragraphs = [item.strip() for item in text.split("\n\n") if item.strip()]
+    if not paragraphs:
+        raise HTTPException(status_code=400, detail="Файл не содержит текста")
+    if len(paragraphs) > BOOK_MAX_PARAGRAPHS:
+        raise HTTPException(status_code=400, detail=f"Слишком много абзацев. Лимит: {BOOK_MAX_PARAGRAPHS}")
+
     job_id = str(uuid.uuid4())
-    job_path = BOOK_UPLOAD_DIR / job_id
-    job_path.mkdir()
-    (job_path / "original.txt").write_bytes(content)
-    return {
+    job_dir = _job_dir(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    async with aiofiles.open(job_dir / "original.txt", "wb") as out:
+        await out.write(content)
+
+    preview = [
+        {"id": index, "text": paragraph[:500]}
+        for index, paragraph in enumerate(paragraphs[:BOOK_PREVIEW_SEGMENTS])
+    ]
+
+    meta = {
         "job_id": job_id,
-        "segments": [{"id": i, "text": p[:500]} for i, p in enumerate(paragraphs)],
-        "total": len(paragraphs)
+        "filename": file.filename,
+        "status": "uploaded",
+        "total": len(paragraphs),
+        "processed": 0,
+        "voice": DEFAULT_VOICE,
+        "language": DEFAULT_LANGUAGE,
+        "response_format": "mp3",
+        "instruct": None,
+        "error": None,
+    }
+    _write_job_meta(job_id, meta)
+
+    return {
+        **meta,
+        "segments": preview,
     }
 
-@app.post("/generate_book/{job_id}")
-async def generate_book(job_id: str, background_tasks: BackgroundTasks):
-    job_path = BOOK_UPLOAD_DIR / job_id
-    if not job_path.exists():
-        raise HTTPException(404, "Job not found")
-    content = (job_path / "original.txt").read_text(encoding="utf-8")
-    paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
-    background_tasks.add_task(generate_book_worker, job_id, paragraphs)
-    return {"status": "started", "job_id": job_id}
 
-async def generate_book_worker(job_id: str, paragraphs: list):
-    output_dir = BOOK_UPLOAD_DIR / job_id / "audio"
-    output_dir.mkdir(exist_ok=True)
-    for idx, para in enumerate(paragraphs):
+async def _generate_book_worker(job_id: str, voice: str, language: str, response_format: str, instruct: str | None) -> None:
+    async with book_generation_lock:
+        output_dir = _job_output_dir(job_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        original_text = (_job_dir(job_id) / "original.txt").read_text(encoding="utf-8-sig")
+        paragraphs = [item.strip() for item in original_text.split("\n\n") if item.strip()]
+
+        meta = _read_job_meta(job_id)
+        meta.update(
+            {
+                "status": "running",
+                "processed": 0,
+                "voice": voice,
+                "language": language,
+                "response_format": response_format,
+                "instruct": instruct,
+                "error": None,
+            }
+        )
+        _write_job_meta(job_id, meta)
+
         try:
-            audio_bytes = await asyncio.to_thread(
-                engine.generate_audio,
-                para,
-                "Vivian",
-                "Russian"
-            )
-            out_file = output_dir / f"part_{idx:04d}.mp3"
-            async with aiofiles.open(out_file, "wb") as f:
-                await f.write(audio_bytes)
-        except Exception as e:
-            logger.error(f"Error generating part {idx}: {e}")
-    logger.info(f"Book generation finished for {job_id}")
+            for index, paragraph in enumerate(paragraphs, start=1):
+                audio_bytes = await engine.generate_audio(
+                    text=paragraph,
+                    voice=voice,
+                    language=language,
+                    response_format=response_format,
+                    instruct=instruct,
+                )
+                file_ext = response_format
+                out_path = output_dir / f"part_{index:04d}.{file_ext}"
+                async with aiofiles.open(out_path, "wb") as out:
+                    await out.write(audio_bytes)
+
+                meta["processed"] = index
+                _write_job_meta(job_id, meta)
+
+            zip_path = _job_dir(job_id) / "audio_bundle.zip"
+            with ZipFile(zip_path, "w", compression=ZIP_DEFLATED) as archive:
+                for item in sorted(output_dir.glob("*")):
+                    archive.write(item, arcname=item.name)
+
+            meta["status"] = "completed"
+            _write_job_meta(job_id, meta)
+        except Exception as exc:  # pragma: no cover - depends on runtime/model
+            logger.exception("Book generation failed")
+            meta["status"] = "failed"
+            meta["error"] = str(exc)
+            _write_job_meta(job_id, meta)
+
+
+@app.post("/api/books/{job_id}/start")
+@app.post("/generate_book/{job_id}")
+async def start_book_generation(job_id: str, request: BookGenerationRequest | None = None):
+    if not _job_dir(job_id).exists():
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    request = request or BookGenerationRequest()
+    _validate_voice_and_language(request.voice, request.language)
+    if request.response_format not in {"mp3", "wav"}:
+        raise HTTPException(status_code=400, detail="Для книги поддерживаются mp3 и wav")
+
+    existing_task = book_tasks.get(job_id)
+    if existing_task and not existing_task.done():
+        return _serialize_job(job_id)
+
+    task = asyncio.create_task(
+        _generate_book_worker(
+            job_id=job_id,
+            voice=request.voice,
+            language=request.language,
+            response_format=request.response_format,
+            instruct=request.instruct,
+        )
+    )
+    book_tasks[job_id] = task
+
+    meta = _read_job_meta(job_id)
+    meta.update(
+        {
+            "status": "queued",
+            "voice": request.voice,
+            "language": request.language,
+            "response_format": request.response_format,
+            "instruct": request.instruct,
+            "error": None,
+        }
+    )
+    _write_job_meta(job_id, meta)
+    return _serialize_job(job_id)
+
+
+@app.get("/api/books/{job_id}")
+async def get_book_job(job_id: str):
+    return _serialize_job(job_id)
+
+
+@app.get("/api/books/{job_id}/download")
+async def download_book_bundle(job_id: str):
+    zip_path = _job_dir(job_id) / "audio_bundle.zip"
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="Архив ещё не готов")
+    return FileResponse(zip_path, media_type="application/zip", filename=f"book-{job_id}.zip")
+
+
+@app.delete("/api/books/{job_id}")
+async def delete_book_job(job_id: str):
+    job_dir = _job_dir(job_id)
+    if not job_dir.exists():
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+
+    task = book_tasks.get(job_id)
+    if task and not task.done():
+        task.cancel()
+
+    shutil.rmtree(job_dir, ignore_errors=True)
+    return {"ok": True}
+
 
 @app.post("/train_voice")
 async def train_voice(
     voice_name: str = Form(...),
     audio_files: list[UploadFile] = File(...),
-    transcriptions: list[str] = Form(...)
+    transcriptions: list[str] = Form(...),
 ):
-    raise HTTPException(501, "Voice training is not implemented in this demo. Use external scripts.")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "Обучение голоса пока не реализовано в веб-интерфейсе. "
+            f"Получено: voice_name={voice_name}, audio_files={len(audio_files)}, transcriptions={len(transcriptions)}"
+        ),
+    )

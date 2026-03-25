@@ -1,3 +1,14 @@
+const state = {
+    currentAudioUrl: null,
+    currentBookJobId: null,
+    bookPollTimer: null,
+    audioContext: null,
+};
+
+function $(selector) {
+    return document.querySelector(selector);
+}
+
 function escapeHtml(value) {
     return String(value)
         .replaceAll("&", "&amp;")
@@ -7,79 +18,144 @@ function escapeHtml(value) {
         .replaceAll("'", "&#039;");
 }
 
-async function loadVoices() {
-    try {
-        const res = await fetch("/voices");
-        const data = await res.json();
-        const voiceSelect = document.getElementById("tts-voice");
-        const voices = Array.isArray(data.voices) ? data.voices : [];
-        voiceSelect.innerHTML = voices
-            .map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`)
-            .join("");
-    } catch (e) {
-        document.getElementById("tts-status").textContent = "Не удалось загрузить список голосов";
+async function apiFetch(url, options = {}) {
+    const response = await fetch(url, options);
+    const contentType = response.headers.get("content-type") || "";
+    const payload = contentType.includes("application/json") ? await response.json() : await response.blob();
+
+    if (!response.ok) {
+        const message = payload?.detail || `HTTP ${response.status}`;
+        throw new Error(message);
     }
+
+    return payload;
+}
+
+function setStatus(element, message, type = "default") {
+    element.textContent = message;
+    element.dataset.state = type;
+}
+
+function setButtonBusy(button, busy, busyLabel = "Загрузка…") {
+    if (!button.dataset.originalLabel) {
+        button.dataset.originalLabel = button.textContent;
+    }
+    button.disabled = busy;
+    button.textContent = busy ? busyLabel : button.dataset.originalLabel;
+}
+
+function revokeAudioUrl() {
+    if (state.currentAudioUrl) {
+        URL.revokeObjectURL(state.currentAudioUrl);
+        state.currentAudioUrl = null;
+    }
+}
+
+function updateTtsCounter() {
+    const length = $("#tts-text").value.length;
+    $("#tts-counter").textContent = `${length} символов`;
+}
+
+function populateSelect(select, values, selectedValue) {
+    select.innerHTML = values.map((value) => {
+        const selected = value === selectedValue ? " selected" : "";
+        return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(value)}</option>`;
+    }).join("");
 }
 
 function getTtsPayload(format = "mp3", stream = false) {
     return {
-        text: document.getElementById("tts-text").value,
-        voice: document.getElementById("tts-voice").value,
-        language: document.getElementById("tts-language").value,
-        instruct: document.getElementById("tts-instruct").value || null,
+        text: $("#tts-text").value.trim(),
+        voice: $("#tts-voice").value,
+        language: $("#tts-language").value,
+        instruct: $("#tts-instruct").value.trim() || null,
         response_format: format,
         stream,
     };
 }
 
+async function loadMeta() {
+    const [voicesData, healthData] = await Promise.all([
+        apiFetch("/api/voices"),
+        apiFetch("/api/health"),
+    ]);
+
+    populateSelect($("#tts-voice"), voicesData.voices, voicesData.default_voice);
+    populateSelect($("#book-voice"), voicesData.voices, voicesData.default_voice);
+    populateSelect($("#tts-language"), voicesData.languages, voicesData.default_language);
+    populateSelect($("#book-language"), voicesData.languages, voicesData.default_language);
+
+    $("#meta-voices").textContent = voicesData.voices.length;
+    $("#meta-languages").textContent = voicesData.languages.join(" · ");
+
+    const chip = $("#engine-chip");
+    const engine = healthData.engine || {};
+    if (engine.loaded) {
+        chip.textContent = "Модель загружена";
+        chip.dataset.state = "success";
+    } else if (engine.last_error) {
+        chip.textContent = "Ошибка загрузки модели";
+        chip.dataset.state = "danger";
+    } else {
+        chip.textContent = "Модель прогревается";
+        chip.dataset.state = "warning";
+    }
+}
+
 async function requestAudio(format) {
-    const status = document.getElementById("tts-status");
-    const audio = document.getElementById("audio-element");
+    const statusEl = $("#tts-status");
+    const audioEl = $("#audio-element");
+    const downloadLink = $("#download-link");
     const payload = getTtsPayload(format, false);
 
-    if (!payload.text.trim()) {
-        status.textContent = "Введите текст";
+    if (!payload.text) {
+        setStatus(statusEl, "Введите текст для синтеза.", "danger");
         return;
     }
 
-    status.textContent = "Синтез...";
+    setButtonBusy($(format === "mp3" ? "#generate-btn" : "#wav-btn"), true, "Генерирую…");
+    setStatus(statusEl, `Синтезирую ${format.toUpperCase()}…`, "warning");
+
     try {
-        const response = await fetch("/v1/audio/speech", {
+        const response = await fetch("/api/audio/speech", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
         });
-
         if (!response.ok) {
             const err = await response.json().catch(() => ({}));
-            throw new Error(err.detail || "Ошибка генерации");
+            throw new Error(err.detail || "Не удалось сгенерировать аудио");
         }
 
         const blob = await response.blob();
-        const url = URL.createObjectURL(blob);
-        audio.src = url;
-        await audio.play().catch(() => {});
-        status.textContent = `Готово: ${format.toUpperCase()}`;
-    } catch (e) {
-        status.textContent = `Ошибка: ${e.message}`;
+        revokeAudioUrl();
+        state.currentAudioUrl = URL.createObjectURL(blob);
+        audioEl.src = state.currentAudioUrl;
+        downloadLink.href = state.currentAudioUrl;
+        downloadLink.download = `speech.${format}`;
+        downloadLink.classList.remove("hidden");
+        await audioEl.play().catch(() => {});
+        setStatus(statusEl, `Готово: ${format.toUpperCase()} создан.`, "success");
+    } catch (error) {
+        setStatus(statusEl, `Ошибка: ${error.message}`, "danger");
+    } finally {
+        setButtonBusy($(format === "mp3" ? "#generate-btn" : "#wav-btn"), false);
     }
 }
 
-document.getElementById("generate-btn").addEventListener("click", () => requestAudio("mp3"));
-document.getElementById("wav-btn").addEventListener("click", () => requestAudio("wav"));
-
-document.getElementById("stream-btn").addEventListener("click", async () => {
-    const status = document.getElementById("tts-status");
+async function streamAudio() {
+    const statusEl = $("#tts-status");
     const payload = getTtsPayload("pcm", true);
-
-    if (!payload.text.trim()) {
-        status.textContent = "Введите текст";
+    if (!payload.text) {
+        setStatus(statusEl, "Введите текст для стриминга.", "danger");
         return;
     }
 
-    status.textContent = "Открываю PCM поток...";
+    setButtonBusy($("#stream-btn"), true, "Стримлю…");
+    setStatus(statusEl, "Подключаю live PCM-поток…", "warning");
+
     try {
-        const response = await fetch("/v1/audio/stream", {
+        const response = await fetch("/api/audio/stream", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -90,12 +166,12 @@ document.getElementById("stream-btn").addEventListener("click", async () => {
             throw new Error(err.detail || "Ошибка стриминга");
         }
 
-        const sampleRate = parseInt(response.headers.get("X-Sample-Rate") || "24000", 10);
-        const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
-        await audioContext.resume();
+        const sampleRate = Number(response.headers.get("X-Sample-Rate") || 24000);
+        state.audioContext ||= new (window.AudioContext || window.webkitAudioContext)({ sampleRate });
+        await state.audioContext.resume();
 
         const reader = response.body.getReader();
-        let nextTime = audioContext.currentTime + 0.05;
+        let nextStart = state.audioContext.currentTime + 0.05;
         let pendingByte = null;
 
         while (true) {
@@ -104,7 +180,6 @@ document.getElementById("stream-btn").addEventListener("click", async () => {
             if (!value || value.length === 0) continue;
 
             let chunk = value;
-
             if (pendingByte !== null) {
                 const merged = new Uint8Array(chunk.length + 1);
                 merged[0] = pendingByte;
@@ -112,146 +187,210 @@ document.getElementById("stream-btn").addEventListener("click", async () => {
                 chunk = merged;
                 pendingByte = null;
             }
-
             if (chunk.length % 2 !== 0) {
                 pendingByte = chunk[chunk.length - 1];
                 chunk = chunk.slice(0, -1);
             }
-
             if (chunk.length === 0) continue;
 
             const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2);
             const float32 = new Float32Array(int16.length);
-            for (let i = 0; i < int16.length; i++) {
-                float32[i] = int16[i] / 32768.0;
+            for (let i = 0; i < int16.length; i += 1) {
+                float32[i] = int16[i] / 32768;
             }
 
-            const buffer = audioContext.createBuffer(1, float32.length, sampleRate);
-            buffer.copyToChannel(float32, 0);
-
-            const source = audioContext.createBufferSource();
-            source.buffer = buffer;
-            source.connect(audioContext.destination);
-
-            const startAt = Math.max(nextTime, audioContext.currentTime + 0.03);
+            const audioBuffer = state.audioContext.createBuffer(1, float32.length, sampleRate);
+            audioBuffer.copyToChannel(float32, 0);
+            const source = state.audioContext.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(state.audioContext.destination);
+            const startAt = Math.max(nextStart, state.audioContext.currentTime + 0.03);
             source.start(startAt);
-            nextTime = startAt + buffer.duration;
+            nextStart = startAt + audioBuffer.duration;
         }
 
-        status.textContent = "PCM поток завершён";
-    } catch (e) {
-        status.textContent = `Ошибка: ${e.message}`;
+        setStatus(statusEl, "PCM-поток завершён.", "success");
+    } catch (error) {
+        setStatus(statusEl, `Ошибка: ${error.message}`, "danger");
+    } finally {
+        setButtonBusy($("#stream-btn"), false);
     }
-});
+}
 
-let currentJobId = null;
+function renderBookPreview(data) {
+    const previewEl = $("#book-preview");
+    const total = data.total || 0;
+    const segments = Array.isArray(data.segments) ? data.segments : [];
+    $("#book-summary").textContent = `${total} абзацев`;
 
-document.getElementById("upload-book-btn").addEventListener("click", async () => {
-    const fileInput = document.getElementById("book-file");
+    if (!segments.length) {
+        previewEl.innerHTML = '<div class="preview-empty">Нет данных для предпросмотра.</div>';
+        return;
+    }
+
+    previewEl.innerHTML = segments
+        .map((segment) => `
+            <article class="preview-item">
+                <div class="preview-index">${segment.id + 1}</div>
+                <p>${escapeHtml(segment.text)}</p>
+            </article>
+        `)
+        .join("");
+}
+
+async function uploadBook() {
+    const fileInput = $("#book-file");
+    const statusEl = $("#book-progress");
     const file = fileInput.files[0];
-    const progress = document.getElementById("book-progress");
 
     if (!file) {
-        progress.textContent = "Выберите файл";
+        setStatus(statusEl, "Выберите .txt файл.", "danger");
         return;
     }
 
     const formData = new FormData();
     formData.append("file", file);
+    setButtonBusy($("#upload-book-btn"), true, "Загружаю…");
+    setStatus(statusEl, "Загружаю и разбираю книгу…", "warning");
 
-    progress.textContent = "Загрузка книги...";
     try {
-        const res = await fetch("/upload_text", { method: "POST", body: formData });
-        const data = await res.json();
-
-        if (!res.ok) {
-            throw new Error(data.detail || "Ошибка загрузки");
-        }
-
-        currentJobId = data.job_id;
-        const previewDiv = document.getElementById("book-preview");
-        previewDiv.innerHTML =
-            `<h3>Предпросмотр (${data.total} абзацев)</h3>` +
-            data.segments
-                .map(s => `<p><strong>${s.id + 1}</strong>: ${escapeHtml(s.text)}</p>`)
-                .join("");
-
-        document.getElementById("generate-book-btn").style.display = "inline-block";
-        progress.textContent = "Книга загружена";
-    } catch (e) {
-        progress.textContent = `Ошибка: ${e.message}`;
+        const data = await apiFetch("/api/books/upload", { method: "POST", body: formData });
+        state.currentBookJobId = data.job_id;
+        renderBookPreview(data);
+        $("#generate-book-btn").classList.remove("hidden");
+        $("#book-download-link").classList.add("hidden");
+        $("#book-progress-bar-wrap").classList.add("hidden");
+        setStatus(statusEl, `Файл загружен. Абзацев: ${data.total}.`, "success");
+    } catch (error) {
+        setStatus(statusEl, `Ошибка: ${error.message}`, "danger");
+    } finally {
+        setButtonBusy($("#upload-book-btn"), false);
     }
-});
+}
 
-document.getElementById("generate-book-btn").addEventListener("click", async () => {
-    const progress = document.getElementById("book-progress");
-    if (!currentJobId) {
-        progress.textContent = "Сначала загрузите книгу";
+function updateBookProgress(data) {
+    const total = Number(data.total || 0);
+    const processed = Number(data.processed || 0);
+    const percent = total > 0 ? Math.round((processed / total) * 100) : 0;
+    $("#book-progress-bar-wrap").classList.remove("hidden");
+    $("#book-progress-bar").style.width = `${percent}%`;
+
+    const statusEl = $("#book-progress");
+    if (data.status === "queued") {
+        setStatus(statusEl, "Задача поставлена в очередь…", "warning");
+    } else if (data.status === "running") {
+        setStatus(statusEl, `Озвучка: ${processed}/${total} (${percent}%).`, "warning");
+    } else if (data.status === "completed") {
+        setStatus(statusEl, `Готово. Создано файлов: ${data.files?.length || 0}.`, "success");
+        if (data.download_url) {
+            const link = $("#book-download-link");
+            link.href = data.download_url;
+            link.classList.remove("hidden");
+        }
+    } else if (data.status === "failed") {
+        setStatus(statusEl, `Ошибка озвучки: ${data.error || "неизвестно"}`, "danger");
+    } else {
+        setStatus(statusEl, `Статус: ${data.status}`, "default");
+    }
+}
+
+function stopBookPolling() {
+    if (state.bookPollTimer) {
+        clearInterval(state.bookPollTimer);
+        state.bookPollTimer = null;
+    }
+}
+
+async function pollBookJob() {
+    if (!state.currentBookJobId) return;
+    try {
+        const data = await apiFetch(`/api/books/${state.currentBookJobId}`);
+        updateBookProgress(data);
+        if (["completed", "failed"].includes(data.status)) {
+            stopBookPolling();
+        }
+    } catch (error) {
+        stopBookPolling();
+        setStatus($("#book-progress"), `Ошибка статуса: ${error.message}`, "danger");
+    }
+}
+
+async function startBookGeneration() {
+    if (!state.currentBookJobId) {
+        setStatus($("#book-progress"), "Сначала загрузите книгу.", "danger");
         return;
     }
 
-    progress.textContent = "Запуск озвучивания...";
+    setButtonBusy($("#generate-book-btn"), true, "Запускаю…");
     try {
-        const res = await fetch(`/generate_book/${currentJobId}`, { method: "POST" });
-        const data = await res.json();
-
-        if (!res.ok) {
-            throw new Error(data.detail || "Ошибка запуска");
-        }
-
-        progress.textContent = `Озвучивание начато. Job ID: ${data.job_id}`;
-    } catch (e) {
-        progress.textContent = `Ошибка: ${e.message}`;
+        const payload = {
+            voice: $("#book-voice").value,
+            language: $("#book-language").value,
+            response_format: $("#book-format").value,
+            instruct: $("#book-instruct").value.trim() || null,
+        };
+        const data = await apiFetch(`/api/books/${state.currentBookJobId}/start`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+        });
+        updateBookProgress(data);
+        stopBookPolling();
+        state.bookPollTimer = setInterval(pollBookJob, 2000);
+        await pollBookJob();
+    } catch (error) {
+        setStatus($("#book-progress"), `Ошибка: ${error.message}`, "danger");
+    } finally {
+        setButtonBusy($("#generate-book-btn"), false);
     }
-});
+}
 
-document.getElementById("train-btn").addEventListener("click", async () => {
-    const voiceName = document.getElementById("voice-name").value.trim();
-    const audioFiles = document.getElementById("train-audio").files;
-    const transcriptsText = document.getElementById("train-transcripts").value;
-    const status = document.getElementById("train-status");
-
-    if (!voiceName || audioFiles.length === 0 || !transcriptsText.trim()) {
-        status.textContent = "Заполните все поля";
-        return;
-    }
-
-    const transcripts = transcriptsText.split("\n").map(s => s.trim()).filter(Boolean);
-    if (audioFiles.length !== transcripts.length) {
-        status.textContent = "Количество аудиофайлов должно совпадать с количеством строк транскрипций";
-        return;
-    }
-
-    const formData = new FormData();
-    formData.append("voice_name", voiceName);
-    for (let i = 0; i < audioFiles.length; i++) {
-        formData.append("audio_files", audioFiles[i]);
-        formData.append("transcriptions", transcripts[i]);
-    }
-
-    try {
-        const res = await fetch("/train_voice", { method: "POST", body: formData });
-        const data = await res.json().catch(() => ({}));
-
-        if (!res.ok) {
-            throw new Error(data.detail || "Не реализовано");
-        }
-
-        status.textContent = "Обучение запущено";
-    } catch (e) {
-        status.textContent = `Ошибка: ${e.message}`;
-    }
-});
-
-document.querySelectorAll(".tab-btn").forEach(btn => {
-    btn.addEventListener("click", () => {
-        document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
-        document.querySelectorAll(".tab-content").forEach(t => t.classList.remove("active"));
-
-        btn.classList.add("active");
-        const tabId = btn.getAttribute("data-tab");
-        document.getElementById(`${tabId}-tab`).classList.add("active");
+function initTabs() {
+    document.querySelectorAll(".tab-btn").forEach((button) => {
+        button.addEventListener("click", () => {
+            document.querySelectorAll(".tab-btn").forEach((item) => {
+                item.classList.remove("active");
+                item.setAttribute("aria-selected", "false");
+            });
+            document.querySelectorAll(".tab-content").forEach((item) => item.classList.remove("active"));
+            button.classList.add("active");
+            button.setAttribute("aria-selected", "true");
+            $(`#${button.dataset.tab}-tab`).classList.add("active");
+        });
     });
+}
+
+function initPromptChips() {
+    document.querySelectorAll("#prompt-chips .chip").forEach((chip) => {
+        chip.addEventListener("click", () => {
+            $("#tts-instruct").value = chip.dataset.prompt;
+        });
+    });
+}
+
+async function init() {
+    initTabs();
+    initPromptChips();
+    $("#tts-text").addEventListener("input", updateTtsCounter);
+    $("#generate-btn").addEventListener("click", () => requestAudio("mp3"));
+    $("#wav-btn").addEventListener("click", () => requestAudio("wav"));
+    $("#stream-btn").addEventListener("click", streamAudio);
+    $("#upload-book-btn").addEventListener("click", uploadBook);
+    $("#generate-book-btn").addEventListener("click", startBookGeneration);
+
+    updateTtsCounter();
+    try {
+        await loadMeta();
+    } catch (error) {
+        setStatus($("#tts-status"), `Не удалось загрузить конфигурацию: ${error.message}`, "danger");
+        $("#engine-chip").textContent = "Backend недоступен";
+        $("#engine-chip").dataset.state = "danger";
+    }
+}
+
+window.addEventListener("beforeunload", () => {
+    stopBookPolling();
+    revokeAudioUrl();
 });
 
-loadVoices();
+init();

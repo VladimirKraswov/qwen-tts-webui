@@ -7,84 +7,153 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="container">
-        <h1>🎙️ Qwen TTS Web UI</h1>
+    <div class="page-shell">
+        <header class="hero">
+            <div>
+                <span class="eyebrow">Qwen3 • Text-to-Speech</span>
+                <h1>Qwen TTS Web UI</h1>
+                <p class="hero-copy">
+                    Быстрый синтез речи, live PCM-стриминг и пакетная озвучка текста в аккуратном интерфейсе без лишней возни.
+                </p>
+            </div>
+            <div class="status-panel">
+                <div class="status-chip" id="engine-chip">Проверяю модель…</div>
+                <div class="meta-grid">
+                    <div>
+                        <span class="meta-label">Голоса</span>
+                        <strong id="meta-voices">—</strong>
+                    </div>
+                    <div>
+                        <span class="meta-label">Языки</span>
+                        <strong id="meta-languages">—</strong>
+                    </div>
+                </div>
+            </div>
+        </header>
 
-        <div class="tabs">
-            <button class="tab-btn active" data-tab="tts">Синтез речи</button>
-            <button class="tab-btn" data-tab="book">Книга</button>
-            <button class="tab-btn" data-tab="train">Обучение голоса</button>
-        </div>
-
-        <div id="tts-tab" class="tab-content active">
-            <div class="form-group">
-                <label for="tts-text">Текст:</label>
-                <textarea id="tts-text" rows="6" placeholder="Введите текст для озвучивания..."></textarea>
+        <main class="app-card">
+            <div class="tabs" role="tablist" aria-label="Режимы приложения">
+                <button class="tab-btn active" data-tab="tts" role="tab" aria-selected="true">Синтез речи</button>
+                <button class="tab-btn" data-tab="book" role="tab" aria-selected="false">Озвучка книги</button>
+                <button class="tab-btn" data-tab="train" role="tab" aria-selected="false">Кастомный голос</button>
             </div>
 
-            <div class="form-group">
-                <label for="tts-voice">Голос:</label>
-                <select id="tts-voice"></select>
-            </div>
+            <section id="tts-tab" class="tab-content active">
+                <div class="grid grid-main">
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h2>Текст</h2>
+                            <span class="counter" id="tts-counter">0 символов</span>
+                        </div>
+                        <textarea id="tts-text" rows="10" placeholder="Введите текст, который нужно озвучить…"></textarea>
+                        <div class="chips" id="prompt-chips">
+                            <button class="chip" type="button" data-prompt="Скажи тепло и спокойно">Тепло и спокойно</button>
+                            <button class="chip" type="button" data-prompt="Скажи бодро и энергично">Бодро</button>
+                            <button class="chip" type="button" data-prompt="Скажи как новостной диктор">Диктор</button>
+                            <button class="chip" type="button" data-prompt="Скажи мягко и дружелюбно">Дружелюбно</button>
+                        </div>
+                    </div>
 
-            <div class="form-group">
-                <label for="tts-language">Язык:</label>
-                <select id="tts-language">
-                    <option value="Russian">Русский</option>
-                    <option value="English">English</option>
-                    <option value="Chinese">中文</option>
-                    <option value="Auto">Auto</option>
-                </select>
-            </div>
+                    <div class="panel">
+                        <h2>Параметры</h2>
+                        <div class="form-grid">
+                            <label class="field">
+                                <span>Голос</span>
+                                <select id="tts-voice"></select>
+                            </label>
+                            <label class="field">
+                                <span>Язык</span>
+                                <select id="tts-language"></select>
+                            </label>
+                            <label class="field field-full">
+                                <span>Инструкция / стиль</span>
+                                <input id="tts-instruct" type="text" placeholder="Например: Скажи радостно и энергично">
+                            </label>
+                        </div>
 
-            <div class="form-group">
-                <label for="tts-instruct">Инструкция / эмоция (необязательно):</label>
-                <input id="tts-instruct" type="text" placeholder="Например: Скажи радостно и энергично">
-            </div>
+                        <div class="action-row">
+                            <button id="generate-btn" class="btn btn-primary">Синтезировать MP3</button>
+                            <button id="wav-btn" class="btn btn-secondary">Синтезировать WAV</button>
+                            <button id="stream-btn" class="btn btn-ghost">Live PCM</button>
+                        </div>
 
-            <div class="button-group">
-                <button id="generate-btn" class="btn">🔊 Синтезировать (MP3)</button>
-                <button id="wav-btn" class="btn secondary">💾 Синтезировать (WAV)</button>
-                <button id="stream-btn" class="btn secondary">⚡ PCM поток</button>
-            </div>
+                        <div class="status-box" id="tts-status">Готов к работе.</div>
+                    </div>
+                </div>
 
-            <div id="tts-status" class="status"></div>
+                <div class="panel audio-panel">
+                    <div class="panel-header">
+                        <h2>Результат</h2>
+                        <a id="download-link" class="link-btn hidden" download>Скачать файл</a>
+                    </div>
+                    <audio controls id="audio-element"></audio>
+                </div>
+            </section>
 
-            <div id="audio-player">
-                <audio controls id="audio-element"></audio>
-            </div>
-        </div>
+            <section id="book-tab" class="tab-content">
+                <div class="grid grid-main">
+                    <div class="panel">
+                        <h2>Загрузка книги</h2>
+                        <label class="field">
+                            <span>Текстовый файл (.txt)</span>
+                            <input type="file" id="book-file" accept=".txt">
+                        </label>
+                        <div class="form-grid compact">
+                            <label class="field">
+                                <span>Голос</span>
+                                <select id="book-voice"></select>
+                            </label>
+                            <label class="field">
+                                <span>Язык</span>
+                                <select id="book-language"></select>
+                            </label>
+                            <label class="field">
+                                <span>Формат</span>
+                                <select id="book-format">
+                                    <option value="mp3">MP3</option>
+                                    <option value="wav">WAV</option>
+                                </select>
+                            </label>
+                        </div>
+                        <label class="field">
+                            <span>Стиль для всей книги</span>
+                            <input type="text" id="book-instruct" placeholder="Например: Читай размеренно и выразительно">
+                        </label>
+                        <div class="action-row">
+                            <button id="upload-book-btn" class="btn btn-primary">Загрузить и разобрать</button>
+                            <button id="generate-book-btn" class="btn btn-secondary hidden">Начать озвучку</button>
+                        </div>
+                        <div class="status-box" id="book-progress">Файл ещё не загружен.</div>
+                        <div class="progress hidden" id="book-progress-bar-wrap">
+                            <div class="progress-bar" id="book-progress-bar"></div>
+                        </div>
+                        <a id="book-download-link" class="link-btn hidden" download>Скачать ZIP</a>
+                    </div>
 
-        <div id="book-tab" class="tab-content">
-            <div class="form-group">
-                <label for="book-file">Загрузить текстовый файл (.txt):</label>
-                <input type="file" id="book-file" accept=".txt">
-            </div>
-            <button id="upload-book-btn" class="btn">📖 Загрузить книгу</button>
-            <div id="book-preview"></div>
-            <button id="generate-book-btn" class="btn" style="display:none;">🎧 Озвучить книгу</button>
-            <div id="book-progress" class="status"></div>
-        </div>
+                    <div class="panel">
+                        <div class="panel-header">
+                            <h2>Предпросмотр</h2>
+                            <span class="counter" id="book-summary">—</span>
+                        </div>
+                        <div id="book-preview" class="preview-empty">После загрузки здесь появятся первые абзацы.</div>
+                    </div>
+                </div>
+            </section>
 
-        <div id="train-tab" class="tab-content">
-            <div class="form-group">
-                <label for="voice-name">Название нового голоса:</label>
-                <input type="text" id="voice-name" placeholder="my_voice">
-            </div>
-            <div class="form-group">
-                <label for="train-audio">Аудиофайлы (несколько):</label>
-                <input type="file" id="train-audio" multiple accept="audio/*">
-            </div>
-            <div class="form-group">
-                <label for="train-transcripts">Тексты расшифровок (по одному на строку):</label>
-                <textarea id="train-transcripts" rows="5" placeholder="Строка 1&#10;Строка 2&#10;..."></textarea>
-            </div>
-            <button id="train-btn" class="btn">🚀 Начать обучение</button>
-            <div id="train-status" class="status"></div>
-            <p class="note">
-                ⚠️ Обучение голосов в этой демо-версии не реализовано.
-            </p>
-        </div>
+            <section id="train-tab" class="tab-content">
+                <div class="panel stack-gap">
+                    <h2>Кастомный голос</h2>
+                    <p class="muted">
+                        В API оставлен endpoint-заглушка, но в UI этот режим честно помечен как будущий. Так пользователь не упирается в кнопку, которая всегда отвечает 501.
+                    </p>
+                    <div class="roadmap">
+                        <div class="roadmap-item">Подготовка датасета и валидация файлов</div>
+                        <div class="roadmap-item">Фоновая задача обучения и трекинг статуса</div>
+                        <div class="roadmap-item">Хранение и выбор пользовательских голосов в интерфейсе</div>
+                    </div>
+                </div>
+            </section>
+        </main>
     </div>
 
     <script src="/static/script.js"></script>
