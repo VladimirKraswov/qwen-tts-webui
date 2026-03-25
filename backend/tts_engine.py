@@ -58,13 +58,19 @@ class TTSEngine:
                 from qwen_tts import Qwen3TTSModel
 
                 dtype = torch.bfloat16 if DTYPE == "bfloat16" else torch.float16
+                attn_impl = "sdpa" if torch.cuda.is_available() else "eager"
 
-                logger.info("Loading model with dtype=%s", dtype)
+                logger.info(
+                    "Loading model with dtype=%s, attn_implementation=%s",
+                    dtype,
+                    attn_impl,
+                )
 
                 self.model = Qwen3TTSModel.from_pretrained(
                     MODEL_NAME,
                     device_map=DEVICE,
                     dtype=dtype,
+                    attn_implementation=attn_impl,
                 )
                 self._last_error = None
                 logger.info("Qwen TTS model loaded")
