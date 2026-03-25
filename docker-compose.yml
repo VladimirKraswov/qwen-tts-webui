@@ -1,25 +1,21 @@
+version: '3.8'
 services:
   tts:
-    build: ./backend
+    build: .
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TTS_MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+      - TTS_DEVICE=cuda:0
+      - TTS_DTYPE=bfloat16
+      - TTS_STREAM_EMIT_FRAMES=6
+      - TTS_STREAM_DECODE_WINDOW=72
     ports:
       - "8000:8000"
     volumes:
-      - ./backend:/app
-      - ./frontend:/frontend
+      - .:/app
       - tts-cache:/root/.cache/huggingface
       - book-uploads:/tmp/book_uploads
-    environment:
-      TTS_MODEL: Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
-      TTS_DEVICE: cuda:0
-      TTS_DTYPE: bfloat16
-      TTS_ATTN: sdpa
-      TTS_STREAM_CHUNK_MS: 200
-      TTS_DEFAULT_VOICE: Vivian
-      TTS_DEFAULT_LANGUAGE: Russian
-      NVIDIA_VISIBLE_DEVICES: all
-      NVIDIA_DRIVER_CAPABILITIES: compute,utility
-    gpus: all
-
 volumes:
   tts-cache:
   book-uploads:
