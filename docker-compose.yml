@@ -4,7 +4,7 @@ services:
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
-      - TTS_MODEL=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+      - TTS_MODEL=Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
       - TTS_DEVICE=cuda:0
       - TTS_DTYPE=bfloat16
       - TTS_STREAM_EMIT_FRAMES=6
