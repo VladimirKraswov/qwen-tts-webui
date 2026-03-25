@@ -9,7 +9,6 @@ from typing import Any
 import numpy as np
 import torch
 from pydub import AudioSegment
-from transformers import AutoConfig
 
 from .config import (
     DEVICE,
@@ -59,23 +58,13 @@ class TTSEngine:
                 from qwen_tts import Qwen3TTSModel
 
                 dtype = torch.bfloat16 if DTYPE == "bfloat16" else torch.float16
-                # Determine the attention implementation to use
-                attn_impl = "sdpa" if torch.cuda.is_available() else "eager"
 
-                # Load the configuration and force the attention implementation
-                # to avoid Flash Attention 2 which would require the flash-attn package.
-                config = AutoConfig.from_pretrained(MODEL_NAME)
-                config._attn_implementation = attn_impl
-                config.attn_implementation = attn_impl
-
-                logger.info("Loading model with dtype=%s, attn_implementation=%s", dtype, attn_impl)
+                logger.info("Loading model with dtype=%s", dtype)
 
                 self.model = Qwen3TTSModel.from_pretrained(
                     MODEL_NAME,
-                    config=config,
                     device_map=DEVICE,
                     dtype=dtype,
-                    attn_implementation=attn_impl,
                 )
                 self._last_error = None
                 logger.info("Qwen TTS model loaded")
