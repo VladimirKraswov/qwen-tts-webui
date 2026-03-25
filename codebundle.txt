@@ -1,7 +1,7 @@
 === CODE BUNDLE ===
 root: /Volumes/Extend/work/qwen-tts-webui
 ignore: .codebundleignore
-generated: 2026-03-25T10:22:30.851Z
+generated: 2026-03-25T11:00:17.536Z
 
 
 
@@ -146,6 +146,7 @@ FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-dev python3-venv \
     ffmpeg sox libsox-fmt-all libsndfile1 git curl \
+    ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python3 -m venv /venv
@@ -157,9 +158,11 @@ COPY backend/requirements.ai.txt /tmp/requirements.ai.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
-    pip install --index-url https://download.pytorch.org/whl/cu124 \
-      torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 && \
-    pip install -r /tmp/requirements.ai.txt
+    # Install PyTorch nightly that supports Blackwell (sm_120)
+    pip install --index-url https://download.pytorch.org/whl/nightly/cu126 \
+      torch torchvision torchaudio && \
+    pip install -r /tmp/requirements.ai.txt && \
+    pip install flash-attn --no-build-isolation
 
 RUN git clone https://github.com/dffdeeq/Qwen3-TTS-streaming.git /opt/qwen-tts-streaming && \
     pip install -e /opt/qwen-tts-streaming --no-deps
@@ -710,15 +713,13 @@ class TTSEngine:
                 from qwen_tts import Qwen3TTSModel
 
                 dtype = torch.bfloat16 if DTYPE == "bfloat16" else torch.float16
-                attn_impl = "sdpa" if torch.cuda.is_available() else "eager"
 
-                logger.info("Loading model with dtype=%s, attn_implementation=%s", dtype, attn_impl)
+                logger.info("Loading model with dtype=%s", dtype)
 
                 self.model = Qwen3TTSModel.from_pretrained(
                     MODEL_NAME,
                     device_map=DEVICE,
                     dtype=dtype,
-                    attn_implementation=attn_impl,
                 )
                 self._last_error = None
                 logger.info("Qwen TTS model loaded")
@@ -2384,4 +2385,4 @@ included: 18
 skipped(binary): 4
 skipped(size): 0
 skipped(ext): 0
-totalBytes(approx): 68060
+totalBytes(approx): 68017

@@ -15,11 +15,14 @@ COPY backend/requirements.ai.txt /tmp/requirements.ai.txt
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --upgrade pip setuptools wheel && \
-    # Install PyTorch nightly that supports Blackwell (sm_120)
-    pip install --index-url https://download.pytorch.org/whl/nightly/cu126 \
-      torch torchvision torchaudio && \
+    # === ИСПРАВЛЕНИЕ: PyTorch nightly с поддержкой CUDA 12.8 + Blackwell (sm_120) ===
+    pip install --pre torch torchvision torchaudio \
+        --index-url https://download.pytorch.org/whl/nightly/cu128 && \
+    # Устанавливаем остальные зависимости
     pip install -r /tmp/requirements.ai.txt && \
+    # flash-attn (рекомендуется для Qwen3-TTS)
     pip install flash-attn --no-build-isolation
 
+# Клонируем и устанавливаем Qwen3-TTS streaming
 RUN git clone https://github.com/dffdeeq/Qwen3-TTS-streaming.git /opt/qwen-tts-streaming && \
     pip install -e /opt/qwen-tts-streaming --no-deps
