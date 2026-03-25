@@ -1,37 +1,12 @@
-FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
-
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    python3-pip \
-    python3-dev \
-    python3-venv \
-    ffmpeg \
-    sox \
-    git \
-    curl \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+FROM qwen-tts-webui-tts-base:latest
 
 WORKDIR /app
-
-RUN python3 -m venv /venv
 ENV PATH="/venv/bin:$PATH"
-ENV PYTHONPATH="/app"
+ENV PYTHONUNBUFFERED=1
 
-COPY backend/requirements.txt /tmp/requirements.txt
-
-RUN python -m pip install --upgrade pip setuptools wheel && \
-    python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124 && \
-    python -m pip install -r /tmp/requirements.txt
-
-RUN git clone --depth 1 https://github.com/dffdeeq/Qwen3-TTS-streaming.git /tmp/qwen-tts-streaming && \
-    python -m pip install -e /tmp/qwen-tts-streaming
+COPY backend/requirements.app.txt /tmp/requirements.app.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r /tmp/requirements.app.txt
 
 COPY backend /app/backend
 COPY frontend /app/frontend

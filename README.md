@@ -2,39 +2,114 @@
 
 Обновлённый веб-интерфейс для синтеза речи на базе Qwen3-TTS.
 
-## Что исправлено
+## Что изменено в сборке
 
-- исправлена сборка Docker: `torch` ставится из репозитория PyTorch отдельно, остальные зависимости — из PyPI;
-- backend переведён на `lifespan`, добавлены health/status endpoints;
-- корректно поддерживаются `mp3` и `wav`, а не только MP3 под видом любого формата;
-- `instruct` теперь реально проходит из UI в движок;
-- добавлен трекинг задач озвучки книги с прогрессом и скачиванием ZIP;
-- frontend полностью обновлён: состояние модели, прогресс, предпросмотр, download actions, более чистый UI/UX.
+Тяжёлые AI-зависимости вынесены в отдельный базовый образ:
 
-## Почему у тебя падала сборка
+- `backend/Dockerfile.ai-base` — CUDA, Python, ffmpeg, PyTorch, transformers и прочие AI-библиотеки;
+- `backend/Dockerfile` — лёгкий runtime-образ приложения поверх готовой AI-базы;
+- `docker-compose.yml` — отдельный build-сервис `tts-base` и основной сервис `tts`.
 
-В Dockerfile использовалось:
+Это нужно, чтобы при обычных правках backend/frontend не пересобирать и не скачивать заново тяжёлые слои с PyTorch и системными пакетами.
+
+## Первый запуск
+
+Собери AI-базу один раз:
 
 ```bash
-pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124
+docker compose build tts-base
 ```
 
-Это подменяло основной индекс пакетов, поэтому `fastapi` и другие зависимости искались только в PyTorch wheel index и не находились.
-
-## Запуск
-
-Важно: в твоей команде не было перевода строки между `git checkout -- backend/Dockerfile` и `docker compose ...`, поэтому shell склеил их в одну команду.
-
-Правильно так:
+Потом подними приложение:
 
 ```bash
-git checkout -- backend/Dockerfile
+docker compose up --build tts
+```
+
+или через `make`:
+
+```bash
+make base
+make up
+```
+
+## Обычный цикл разработки
+
+Когда меняешь только код:
+
+```bash
+docker compose up --build tts
+```
+
+или просто:
+
+```bash
+docker compose up tts
+```
+
+если контейнер уже был собран.
+
+### Важно
+
+Для правок кода **не используй** каждый раз:
+
+```bash
 docker compose down --volumes --rmi all
 docker compose build --no-cache
-docker compose up
 ```
 
-## Структура API
+Именно эти флаги убивают весь эффект кеша и заставляют Docker заново скачивать и пересобирать тяжёлые зависимости.
+
+## Когда нужно пересобрать AI-базу
+
+Пересобирай `tts-base`, если изменилось одно из этого:
+
+- `backend/Dockerfile.ai-base`
+- `backend/requirements.ai.txt`
+- версия CUDA / PyTorch
+- системные пакеты для модели
+
+Команда:
+
+```bash
+docker compose build --no-cache tts-base
+docker compose build --no-cache tts
+```
+
+или:
+
+```bash
+make rebuild-base
+```
+
+## Структура зависимостей
+
+### AI-слой
+
+`backend/requirements.ai.txt`
+
+- `torch`
+- `transformers`
+- `qwen-tts`
+- `ctranslate2`
+- `faster-whisper`
+- `pydub`
+- `soundfile`
+- `numpy`
+
+### App-слой
+
+`backend/requirements.app.txt`
+
+- `fastapi`
+- `uvicorn`
+- `python-multipart`
+- `pyyaml`
+- `openai`
+- `requests`
+- `aiofiles`
+
+## API
 
 - `GET /api/health`
 - `GET /api/voices`
@@ -45,6 +120,6 @@ docker compose up
 - `GET /api/books/{job_id}`
 - `GET /api/books/{job_id}/download`
 
-## Замечание по GPU
+## GPU
 
-Для Docker Compose добавлена современная GPU-конфигурация через `deploy.resources.reservations.devices`. Убедись, что на хосте установлен NVIDIA Container Toolkit.
+Для Docker Compose используется reservation через `deploy.resources.reservations.devices`. Проверь, что на хосте установлен NVIDIA Container Toolkit.
