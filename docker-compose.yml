@@ -1,7 +1,6 @@
-version: '3.8'
 services:
   tts:
-    build: .
+    build: ./backend
     runtime: nvidia
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
@@ -13,7 +12,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/app
+      - ./backend:/app
+      - ./frontend:/app/frontend
       - tts-cache:/root/.cache/huggingface
       - book-uploads:/tmp/book_uploads
 volumes:
