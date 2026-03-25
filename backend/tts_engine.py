@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 class TTSEngine:
     def __init__(self) -> None:
-        self.model = None
+        self.model: Any | None = None
         self._model_lock = threading.Lock()
         self._generation_lock = asyncio.Lock()
         self._last_error: str | None = None
@@ -53,6 +53,7 @@ class TTSEngine:
         with self._model_lock:
             if self.model is not None:
                 return
+
             try:
                 from qwen_tts import Qwen3TTSModel
 
@@ -67,21 +68,31 @@ class TTSEngine:
                 )
                 self._last_error = None
                 logger.info("Qwen TTS model loaded")
-            except Exception as exc:  # pragma: no cover - depends on runtime package/model
+            except Exception as exc:  # pragma: no cover
                 self._last_error = str(exc)
                 logger.exception("Failed to load TTS model")
                 raise
 
     def _normalize_pcm(self, pcm: Any) -> np.ndarray:
-        arr = np.asarray(pcm)
+        arr = np.asarray(pcm).reshape(-1)
+
         if arr.dtype == np.int16:
             return arr
+
         if np.issubdtype(arr.dtype, np.floating):
             clipped = np.clip(arr, -1.0, 1.0)
             return (clipped * 32767).astype(np.int16)
+
         return arr.astype(np.int16)
 
-    def _build_generate_kwargs(self, method_name: str, text: str, voice: str, language: str, instruct: str | None) -> dict[str, Any]:
+    def _build_generate_kwargs(
+        self,
+        method_name: str,
+        text: str,
+        voice: str,
+        language: str,
+        instruct: str | None,
+    ) -> dict[str, Any]:
         if self.model is None:
             raise RuntimeError("TTS model is not loaded")
 
@@ -91,12 +102,15 @@ class TTSEngine:
 
         if "text" in params:
             kwargs["text"] = text
+
         if "speaker" in params:
             kwargs["speaker"] = voice
         elif "voice" in params:
             kwargs["voice"] = voice
+
         if "language" in params:
             kwargs["language"] = language
+
         if "return_numpy" in params:
             kwargs["return_numpy"] = True
 
@@ -127,12 +141,26 @@ class TTSEngine:
 
     def _pcm_to_wav_bytes(self, pcm: np.ndarray) -> bytes:
         buffer = io.BytesIO()
-        with wave.open(buffer, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(SAMPLE_RATE)
-            wav.writeframes(pcm.tobytes())
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(SAMPLE_RATE)
+            wav_file.writeframes(pcm.tobytes())
         return buffer.getvalue()
+
+    async def _generate_pcm_locked(
+        self,
+        text: str,
+        voice: str,
+        language: str,
+        instruct: str | None,
+    ) -> np.ndarray:
+        if self.model is None:
+            raise RuntimeError("TTS model is not loaded")
+
+        kwargs = self._build_generate_kwargs("generate_pcm", text, voice, language, instruct)
+        pcm = await asyncio.to_thread(self.model.generate_pcm, **kwargs)
+        return self._normalize_pcm(pcm)
 
     async def generate_audio(
         self,
@@ -146,40 +174,40 @@ class TTSEngine:
             await asyncio.to_thread(self.load_model)
 
         async with self._generation_lock:
-            kwargs = self._build_generate_kwargs("generate_pcm", text, voice, language, instruct)
-            pcm = await asyncio.to_thread(self.model.generate_pcm, **kwargs)
-            normalized = self._normalize_pcm(pcm)
+            normalized = await self._generate_pcm_locked(text, voice, language, instruct)
 
-            if response_format == "wav":
-                return self._pcm_to_wav_bytes(normalized)
-            if response_format == "mp3":
-                return self._pcm_to_mp3_bytes(normalized)
-            return normalized.tobytes()
+        if response_format == "wav":
+            return self._pcm_to_wav_bytes(normalized)
+        if response_format == "mp3":
+            return self._pcm_to_mp3_bytes(normalized)
+        return normalized.tobytes()
 
-    async def stream_generate(self, text: str, voice: str, language: str, instruct: str | None = None):
+    async def stream_generate(
+        self,
+        text: str,
+        voice: str,
+        language: str,
+        instruct: str | None = None,
+    ):
         if self.model is None:
             await asyncio.to_thread(self.load_model)
 
-        async with self._generation_lock:
-            if hasattr(self.model, "stream_generate_pcm"):
+        if self.model is not None and hasattr(self.model, "stream_generate_pcm"):
+            async with self._generation_lock:
                 kwargs = self._build_generate_kwargs("stream_generate_pcm", text, voice, language, instruct)
                 for chunk in self.model.stream_generate_pcm(**kwargs):
                     normalized = self._normalize_pcm(chunk)
                     yield normalized.tobytes()
                     await asyncio.sleep(0)
-                return
+            return
 
-            pcm = await self.generate_audio(
-                text=text,
-                voice=voice,
-                language=language,
-                response_format="pcm",
-                instruct=instruct,
-            )
-            chunk_size = SAMPLE_RATE // 4 * 2
-            for index in range(0, len(pcm), chunk_size):
-                yield pcm[index : index + chunk_size]
-                await asyncio.sleep(0)
+        async with self._generation_lock:
+            normalized = await self._generate_pcm_locked(text, voice, language, instruct)
+
+        chunk_samples = SAMPLE_RATE // 4
+        for index in range(0, len(normalized), chunk_samples):
+            yield normalized[index:index + chunk_samples].tobytes()
+            await asyncio.sleep(0)
 
 
 engine = TTSEngine()

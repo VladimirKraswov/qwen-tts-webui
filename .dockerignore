@@ -1,0 +1,14 @@
+.git
+.gitignore
+.vscode
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+node_modules
+codebundle.txt
+book_uploads
+dist
+build

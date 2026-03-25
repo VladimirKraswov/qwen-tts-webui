@@ -5,7 +5,6 @@ import shutil
 import uuid
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Literal
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import aiofiles
@@ -16,7 +15,6 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import (
-    ALLOWED_AUDIO_FORMATS,
     APP_NAME,
     APP_VERSION,
     BOOK_MAX_FILE_SIZE_MB,
@@ -33,7 +31,10 @@ from .config import (
 )
 from .tts_engine import engine
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 logger = logging.getLogger(__name__)
 
 
@@ -41,7 +42,7 @@ class TTSRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=MAX_TTS_TEXT_LENGTH)
     voice: str = DEFAULT_VOICE
     language: str = DEFAULT_LANGUAGE
-    response_format: Literal["mp3", "wav", "pcm"] = "mp3"
+    response_format: str = Field(default="mp3", pattern="^(mp3|wav|pcm)$")
     stream: bool = False
     instruct: str | None = Field(default=None, max_length=250)
 
@@ -49,12 +50,15 @@ class TTSRequest(BaseModel):
 class BookGenerationRequest(BaseModel):
     voice: str = DEFAULT_VOICE
     language: str = DEFAULT_LANGUAGE
-    response_format: Literal["mp3", "wav"] = "mp3"
+    response_format: str = Field(default="mp3", pattern="^(mp3|wav)$")
     instruct: str | None = Field(default=None, max_length=250)
 
 
 book_tasks: dict[str, asyncio.Task] = {}
-book_generation_lock = asyncio.Lock()
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    return [item.strip() for item in text.split("\n\n") if item.strip()]
 
 
 async def _warm_model() -> None:
@@ -88,7 +92,6 @@ if FRONTEND_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
-
 def _job_dir(job_id: str) -> Path:
     return BOOK_UPLOAD_DIR / job_id
 
@@ -101,9 +104,16 @@ def _job_output_dir(job_id: str) -> Path:
     return _job_dir(job_id) / "audio"
 
 
+def _job_zip_path(job_id: str) -> Path:
+    return _job_dir(job_id) / "audio_bundle.zip"
+
+
 def _write_job_meta(job_id: str, payload: dict) -> None:
     _job_dir(job_id).mkdir(parents=True, exist_ok=True)
-    _job_meta_path(job_id).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _job_meta_path(job_id).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def _read_job_meta(job_id: str) -> dict:
@@ -115,9 +125,11 @@ def _read_job_meta(job_id: str) -> dict:
 
 def _serialize_job(job_id: str) -> dict:
     meta = _read_job_meta(job_id)
-    zip_path = _job_dir(job_id) / "audio_bundle.zip"
+    output_dir = _job_output_dir(job_id)
+    zip_path = _job_zip_path(job_id)
+
     meta["download_url"] = f"/api/books/{job_id}/download" if zip_path.exists() else None
-    meta["files"] = sorted([item.name for item in _job_output_dir(job_id).glob("*")]) if _job_output_dir(job_id).exists() else []
+    meta["files"] = sorted(item.name for item in output_dir.glob("*")) if output_dir.exists() else []
     return meta
 
 
@@ -128,11 +140,20 @@ def _validate_voice_and_language(voice: str, language: str) -> None:
         raise HTTPException(status_code=400, detail="Некорректный язык")
 
 
+def _attach_task_cleanup(job_id: str, task: asyncio.Task) -> None:
+    def _cleanup(_: asyncio.Task) -> None:
+        current = book_tasks.get(job_id)
+        if current is task:
+            book_tasks.pop(job_id, None)
+
+    task.add_done_callback(_cleanup)
+
+
 @app.get("/")
 async def root():
     index_path = FRONTEND_DIR / "index.html"
     if index_path.exists():
-        return FileResponse(index_path)
+        return FileResponse(index_path, media_type="text/html; charset=utf-8")
     return JSONResponse({"message": f"{APP_NAME} backend is running"})
 
 
@@ -157,6 +178,7 @@ async def get_voices() -> dict:
 @app.post("/v1/audio/speech")
 async def generate_speech(request: TTSRequest):
     _validate_voice_and_language(request.voice, request.language)
+
     if request.response_format not in {"mp3", "wav"}:
         raise HTTPException(status_code=400, detail="Поддерживаются только mp3 и wav")
 
@@ -168,12 +190,13 @@ async def generate_speech(request: TTSRequest):
             response_format=request.response_format,
             instruct=request.instruct,
         )
-    except Exception as exc:  # pragma: no cover - depends on runtime/model
+    except Exception as exc:  # pragma: no cover
         logger.exception("Speech generation failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     media_type = "audio/mpeg" if request.response_format == "mp3" else "audio/wav"
     filename = f"speech.{request.response_format}"
+
     return StreamingResponse(
         iter([audio_bytes]),
         media_type=media_type,
@@ -185,6 +208,7 @@ async def generate_speech(request: TTSRequest):
 @app.post("/v1/audio/stream")
 async def stream_speech(request: TTSRequest):
     _validate_voice_and_language(request.voice, request.language)
+
     if not request.stream:
         return await generate_speech(request)
 
@@ -197,9 +221,11 @@ async def stream_speech(request: TTSRequest):
                 instruct=request.instruct,
             ):
                 yield chunk
-        except Exception as exc:  # pragma: no cover - depends on runtime/model
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover
             logger.exception("Stream generation failed")
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            return
 
     return StreamingResponse(
         generator(),
@@ -221,18 +247,27 @@ async def upload_book_text(file: UploadFile = File(...)):
     content = await file.read()
     max_bytes = BOOK_MAX_FILE_SIZE_MB * 1024 * 1024
     if len(content) > max_bytes:
-        raise HTTPException(status_code=400, detail=f"Файл слишком большой. Лимит: {BOOK_MAX_FILE_SIZE_MB} MB")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Файл слишком большой. Лимит: {BOOK_MAX_FILE_SIZE_MB} MB",
+        )
 
     text = content.decode("utf-8-sig", errors="replace")
-    paragraphs = [item.strip() for item in text.split("\n\n") if item.strip()]
+    paragraphs = _split_paragraphs(text)
+
     if not paragraphs:
         raise HTTPException(status_code=400, detail="Файл не содержит текста")
+
     if len(paragraphs) > BOOK_MAX_PARAGRAPHS:
-        raise HTTPException(status_code=400, detail=f"Слишком много абзацев. Лимит: {BOOK_MAX_PARAGRAPHS}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Слишком много абзацев. Лимит: {BOOK_MAX_PARAGRAPHS}",
+        )
 
     job_id = str(uuid.uuid4())
     job_dir = _job_dir(job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
+
     async with aiofiles.open(job_dir / "original.txt", "wb") as out:
         await out.write(content)
 
@@ -255,62 +290,75 @@ async def upload_book_text(file: UploadFile = File(...)):
     }
     _write_job_meta(job_id, meta)
 
-    return {
-        **meta,
-        "segments": preview,
-    }
+    return {**meta, "segments": preview}
 
 
-async def _generate_book_worker(job_id: str, voice: str, language: str, response_format: str, instruct: str | None) -> None:
-    async with book_generation_lock:
-        output_dir = _job_output_dir(job_id)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        original_text = (_job_dir(job_id) / "original.txt").read_text(encoding="utf-8-sig")
-        paragraphs = [item.strip() for item in original_text.split("\n\n") if item.strip()]
+async def _generate_book_worker(
+    job_id: str,
+    voice: str,
+    language: str,
+    response_format: str,
+    instruct: str | None,
+) -> None:
+    output_dir = _job_output_dir(job_id)
+    zip_path = _job_zip_path(job_id)
 
-        meta = _read_job_meta(job_id)
-        meta.update(
-            {
-                "status": "running",
-                "processed": 0,
-                "voice": voice,
-                "language": language,
-                "response_format": response_format,
-                "instruct": instruct,
-                "error": None,
-            }
-        )
+    shutil.rmtree(output_dir, ignore_errors=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with suppress(FileNotFoundError):
+        zip_path.unlink()
+
+    original_text = (_job_dir(job_id) / "original.txt").read_text(encoding="utf-8-sig")
+    paragraphs = _split_paragraphs(original_text)
+
+    meta = _read_job_meta(job_id)
+    meta.update(
+        {
+            "status": "running",
+            "processed": 0,
+            "voice": voice,
+            "language": language,
+            "response_format": response_format,
+            "instruct": instruct,
+            "error": None,
+        }
+    )
+    _write_job_meta(job_id, meta)
+
+    try:
+        for index, paragraph in enumerate(paragraphs, start=1):
+            audio_bytes = await engine.generate_audio(
+                text=paragraph,
+                voice=voice,
+                language=language,
+                response_format=response_format,
+                instruct=instruct,
+            )
+            out_path = output_dir / f"part_{index:04d}.{response_format}"
+            async with aiofiles.open(out_path, "wb") as out:
+                await out.write(audio_bytes)
+
+            meta["processed"] = index
+            _write_job_meta(job_id, meta)
+
+        with ZipFile(zip_path, "w", compression=ZIP_DEFLATED) as archive:
+            for item in sorted(output_dir.glob("*")):
+                archive.write(item, arcname=item.name)
+
+        meta["status"] = "completed"
         _write_job_meta(job_id, meta)
 
-        try:
-            for index, paragraph in enumerate(paragraphs, start=1):
-                audio_bytes = await engine.generate_audio(
-                    text=paragraph,
-                    voice=voice,
-                    language=language,
-                    response_format=response_format,
-                    instruct=instruct,
-                )
-                file_ext = response_format
-                out_path = output_dir / f"part_{index:04d}.{file_ext}"
-                async with aiofiles.open(out_path, "wb") as out:
-                    await out.write(audio_bytes)
+    except asyncio.CancelledError:
+        meta["status"] = "cancelled"
+        meta["error"] = "Задача отменена"
+        _write_job_meta(job_id, meta)
+        raise
 
-                meta["processed"] = index
-                _write_job_meta(job_id, meta)
-
-            zip_path = _job_dir(job_id) / "audio_bundle.zip"
-            with ZipFile(zip_path, "w", compression=ZIP_DEFLATED) as archive:
-                for item in sorted(output_dir.glob("*")):
-                    archive.write(item, arcname=item.name)
-
-            meta["status"] = "completed"
-            _write_job_meta(job_id, meta)
-        except Exception as exc:  # pragma: no cover - depends on runtime/model
-            logger.exception("Book generation failed")
-            meta["status"] = "failed"
-            meta["error"] = str(exc)
-            _write_job_meta(job_id, meta)
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Book generation failed")
+        meta["status"] = "failed"
+        meta["error"] = str(exc)
+        _write_job_meta(job_id, meta)
 
 
 @app.post("/api/books/{job_id}/start")
@@ -319,10 +367,8 @@ async def start_book_generation(job_id: str, request: BookGenerationRequest | No
     if not _job_dir(job_id).exists():
         raise HTTPException(status_code=404, detail="Задача не найдена")
 
-    request = request or BookGenerationRequest()
-    _validate_voice_and_language(request.voice, request.language)
-    if request.response_format not in {"mp3", "wav"}:
-        raise HTTPException(status_code=400, detail="Для книги поддерживаются mp3 и wav")
+    payload = request or BookGenerationRequest()
+    _validate_voice_and_language(payload.voice, payload.language)
 
     existing_task = book_tasks.get(job_id)
     if existing_task and not existing_task.done():
@@ -331,26 +377,28 @@ async def start_book_generation(job_id: str, request: BookGenerationRequest | No
     task = asyncio.create_task(
         _generate_book_worker(
             job_id=job_id,
-            voice=request.voice,
-            language=request.language,
-            response_format=request.response_format,
-            instruct=request.instruct,
+            voice=payload.voice,
+            language=payload.language,
+            response_format=payload.response_format,
+            instruct=payload.instruct,
         )
     )
     book_tasks[job_id] = task
+    _attach_task_cleanup(job_id, task)
 
     meta = _read_job_meta(job_id)
     meta.update(
         {
             "status": "queued",
-            "voice": request.voice,
-            "language": request.language,
-            "response_format": request.response_format,
-            "instruct": request.instruct,
+            "voice": payload.voice,
+            "language": payload.language,
+            "response_format": payload.response_format,
+            "instruct": payload.instruct,
             "error": None,
         }
     )
     _write_job_meta(job_id, meta)
+
     return _serialize_job(job_id)
 
 
@@ -361,7 +409,7 @@ async def get_book_job(job_id: str):
 
 @app.get("/api/books/{job_id}/download")
 async def download_book_bundle(job_id: str):
-    zip_path = _job_dir(job_id) / "audio_bundle.zip"
+    zip_path = _job_zip_path(job_id)
     if not zip_path.exists():
         raise HTTPException(status_code=404, detail="Архив ещё не готов")
     return FileResponse(zip_path, media_type="application/zip", filename=f"book-{job_id}.zip")
@@ -376,8 +424,11 @@ async def delete_book_job(job_id: str):
     task = book_tasks.get(job_id)
     if task and not task.done():
         task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
 
     shutil.rmtree(job_dir, ignore_errors=True)
+    book_tasks.pop(job_id, None)
     return {"ok": True}
 
 

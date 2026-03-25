@@ -2,7 +2,9 @@ const state = {
     currentAudioUrl: null,
     currentBookJobId: null,
     bookPollTimer: null,
+    healthPollTimer: null,
     audioContext: null,
+    streamAbortController: null,
 };
 
 function $(selector) {
@@ -21,7 +23,9 @@ function escapeHtml(value) {
 async function apiFetch(url, options = {}) {
     const response = await fetch(url, options);
     const contentType = response.headers.get("content-type") || "";
-    const payload = contentType.includes("application/json") ? await response.json() : await response.blob();
+    const payload = contentType.includes("application/json")
+        ? await response.json()
+        : await response.blob();
 
     if (!response.ok) {
         const message = payload?.detail || `HTTP ${response.status}`;
@@ -44,6 +48,12 @@ function setButtonBusy(button, busy, busyLabel = "Загрузка…") {
     button.textContent = busy ? busyLabel : button.dataset.originalLabel;
 }
 
+function setStreamButtonState(streaming) {
+    const button = $("#stream-btn");
+    button.dataset.streaming = streaming ? "true" : "false";
+    button.textContent = streaming ? "Остановить Live PCM" : "Live PCM";
+}
+
 function revokeAudioUrl() {
     if (state.currentAudioUrl) {
         URL.revokeObjectURL(state.currentAudioUrl);
@@ -57,10 +67,12 @@ function updateTtsCounter() {
 }
 
 function populateSelect(select, values, selectedValue) {
-    select.innerHTML = values.map((value) => {
-        const selected = value === selectedValue ? " selected" : "";
-        return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(value)}</option>`;
-    }).join("");
+    select.innerHTML = values
+        .map((value) => {
+            const selected = value === selectedValue ? " selected" : "";
+            return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(value)}</option>`;
+        })
+        .join("");
 }
 
 function getTtsPayload(format = "mp3", stream = false) {
@@ -74,12 +86,27 @@ function getTtsPayload(format = "mp3", stream = false) {
     };
 }
 
-async function loadMeta() {
-    const [voicesData, healthData] = await Promise.all([
-        apiFetch("/api/voices"),
-        apiFetch("/api/health"),
-    ]);
+function updateEngineChip(engine = {}) {
+    const chip = $("#engine-chip");
 
+    if (engine.loaded) {
+        chip.textContent = "Модель загружена";
+        chip.dataset.state = "success";
+        return;
+    }
+
+    if (engine.last_error) {
+        chip.textContent = "Ошибка загрузки модели";
+        chip.dataset.state = "danger";
+        return;
+    }
+
+    chip.textContent = "Модель прогревается";
+    chip.dataset.state = "warning";
+}
+
+async function loadMeta() {
+    const voicesData = await apiFetch("/api/voices");
     populateSelect($("#tts-voice"), voicesData.voices, voicesData.default_voice);
     populateSelect($("#book-voice"), voicesData.voices, voicesData.default_voice);
     populateSelect($("#tts-language"), voicesData.languages, voicesData.default_language);
@@ -88,18 +115,25 @@ async function loadMeta() {
     $("#meta-voices").textContent = voicesData.voices.length;
     $("#meta-languages").textContent = voicesData.languages.join(" · ");
 
-    const chip = $("#engine-chip");
-    const engine = healthData.engine || {};
-    if (engine.loaded) {
-        chip.textContent = "Модель загружена";
-        chip.dataset.state = "success";
-    } else if (engine.last_error) {
-        chip.textContent = "Ошибка загрузки модели";
-        chip.dataset.state = "danger";
-    } else {
-        chip.textContent = "Модель прогревается";
-        chip.dataset.state = "warning";
+    const healthData = await apiFetch("/api/health");
+    updateEngineChip(healthData.engine || {});
+}
+
+async function refreshHealth() {
+    try {
+        const healthData = await apiFetch("/api/health");
+        updateEngineChip(healthData.engine || {});
+    } catch {
+        $("#engine-chip").textContent = "Backend недоступен";
+        $("#engine-chip").dataset.state = "danger";
     }
+}
+
+function startHealthPolling() {
+    if (state.healthPollTimer) {
+        clearInterval(state.healthPollTimer);
+    }
+    state.healthPollTimer = setInterval(refreshHealth, 5000);
 }
 
 async function requestAudio(format) {
@@ -122,6 +156,7 @@ async function requestAudio(format) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
         });
+
         if (!response.ok) {
             const err = await response.json().catch(() => ({}));
             throw new Error(err.detail || "Не удалось сгенерировать аудио");
@@ -130,10 +165,12 @@ async function requestAudio(format) {
         const blob = await response.blob();
         revokeAudioUrl();
         state.currentAudioUrl = URL.createObjectURL(blob);
+
         audioEl.src = state.currentAudioUrl;
         downloadLink.href = state.currentAudioUrl;
         downloadLink.download = `speech.${format}`;
         downloadLink.classList.remove("hidden");
+
         await audioEl.play().catch(() => {});
         setStatus(statusEl, `Готово: ${format.toUpperCase()} создан.`, "success");
     } catch (error) {
@@ -145,13 +182,21 @@ async function requestAudio(format) {
 
 async function streamAudio() {
     const statusEl = $("#tts-status");
+
+    if (state.streamAbortController) {
+        state.streamAbortController.abort();
+        return;
+    }
+
     const payload = getTtsPayload("pcm", true);
     if (!payload.text) {
         setStatus(statusEl, "Введите текст для стриминга.", "danger");
         return;
     }
 
-    setButtonBusy($("#stream-btn"), true, "Стримлю…");
+    const abortController = new AbortController();
+    state.streamAbortController = abortController;
+    setStreamButtonState(true);
     setStatus(statusEl, "Подключаю live PCM-поток…", "warning");
 
     try {
@@ -159,6 +204,7 @@ async function streamAudio() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
+            signal: abortController.signal,
         });
 
         if (!response.ok || !response.body) {
@@ -180,6 +226,7 @@ async function streamAudio() {
             if (!value || value.length === 0) continue;
 
             let chunk = value;
+
             if (pendingByte !== null) {
                 const merged = new Uint8Array(chunk.length + 1);
                 merged[0] = pendingByte;
@@ -187,23 +234,28 @@ async function streamAudio() {
                 chunk = merged;
                 pendingByte = null;
             }
+
             if (chunk.length % 2 !== 0) {
                 pendingByte = chunk[chunk.length - 1];
                 chunk = chunk.slice(0, -1);
             }
+
             if (chunk.length === 0) continue;
 
             const int16 = new Int16Array(chunk.buffer, chunk.byteOffset, chunk.byteLength / 2);
             const float32 = new Float32Array(int16.length);
+
             for (let i = 0; i < int16.length; i += 1) {
                 float32[i] = int16[i] / 32768;
             }
 
             const audioBuffer = state.audioContext.createBuffer(1, float32.length, sampleRate);
             audioBuffer.copyToChannel(float32, 0);
+
             const source = state.audioContext.createBufferSource();
             source.buffer = audioBuffer;
             source.connect(state.audioContext.destination);
+
             const startAt = Math.max(nextStart, state.audioContext.currentTime + 0.03);
             source.start(startAt);
             nextStart = startAt + audioBuffer.duration;
@@ -211,9 +263,14 @@ async function streamAudio() {
 
         setStatus(statusEl, "PCM-поток завершён.", "success");
     } catch (error) {
-        setStatus(statusEl, `Ошибка: ${error.message}`, "danger");
+        if (error.name === "AbortError") {
+            setStatus(statusEl, "PCM-поток остановлен.", "default");
+        } else {
+            setStatus(statusEl, `Ошибка: ${error.message}`, "danger");
+        }
     } finally {
-        setButtonBusy($("#stream-btn"), false);
+        state.streamAbortController = null;
+        setStreamButtonState(false);
     }
 }
 
@@ -221,6 +278,7 @@ function renderBookPreview(data) {
     const previewEl = $("#book-preview");
     const total = data.total || 0;
     const segments = Array.isArray(data.segments) ? data.segments : [];
+
     $("#book-summary").textContent = `${total} абзацев`;
 
     if (!segments.length) {
@@ -250,16 +308,19 @@ async function uploadBook() {
 
     const formData = new FormData();
     formData.append("file", file);
+
     setButtonBusy($("#upload-book-btn"), true, "Загружаю…");
     setStatus(statusEl, "Загружаю и разбираю книгу…", "warning");
 
     try {
         const data = await apiFetch("/api/books/upload", { method: "POST", body: formData });
         state.currentBookJobId = data.job_id;
+
         renderBookPreview(data);
         $("#generate-book-btn").classList.remove("hidden");
         $("#book-download-link").classList.add("hidden");
         $("#book-progress-bar-wrap").classList.add("hidden");
+
         setStatus(statusEl, `Файл загружен. Абзацев: ${data.total}.`, "success");
     } catch (error) {
         setStatus(statusEl, `Ошибка: ${error.message}`, "danger");
@@ -272,15 +333,18 @@ function updateBookProgress(data) {
     const total = Number(data.total || 0);
     const processed = Number(data.processed || 0);
     const percent = total > 0 ? Math.round((processed / total) * 100) : 0;
+
     $("#book-progress-bar-wrap").classList.remove("hidden");
     $("#book-progress-bar").style.width = `${percent}%`;
 
     const statusEl = $("#book-progress");
+
     if (data.status === "queued") {
         setStatus(statusEl, "Задача поставлена в очередь…", "warning");
     } else if (data.status === "running") {
         setStatus(statusEl, `Озвучка: ${processed}/${total} (${percent}%).`, "warning");
     } else if (data.status === "completed") {
+        $("#book-progress-bar").style.width = "100%";
         setStatus(statusEl, `Готово. Создано файлов: ${data.files?.length || 0}.`, "success");
         if (data.download_url) {
             const link = $("#book-download-link");
@@ -289,6 +353,8 @@ function updateBookProgress(data) {
         }
     } else if (data.status === "failed") {
         setStatus(statusEl, `Ошибка озвучки: ${data.error || "неизвестно"}`, "danger");
+    } else if (data.status === "cancelled") {
+        setStatus(statusEl, "Озвучка отменена.", "default");
     } else {
         setStatus(statusEl, `Статус: ${data.status}`, "default");
     }
@@ -303,10 +369,12 @@ function stopBookPolling() {
 
 async function pollBookJob() {
     if (!state.currentBookJobId) return;
+
     try {
         const data = await apiFetch(`/api/books/${state.currentBookJobId}`);
         updateBookProgress(data);
-        if (["completed", "failed"].includes(data.status)) {
+
+        if (["completed", "failed", "cancelled"].includes(data.status)) {
             stopBookPolling();
         }
     } catch (error) {
@@ -322,6 +390,7 @@ async function startBookGeneration() {
     }
 
     setButtonBusy($("#generate-book-btn"), true, "Запускаю…");
+
     try {
         const payload = {
             voice: $("#book-voice").value,
@@ -329,11 +398,13 @@ async function startBookGeneration() {
             response_format: $("#book-format").value,
             instruct: $("#book-instruct").value.trim() || null,
         };
+
         const data = await apiFetch(`/api/books/${state.currentBookJobId}/start`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
         });
+
         updateBookProgress(data);
         stopBookPolling();
         state.bookPollTimer = setInterval(pollBookJob, 2000);
@@ -352,7 +423,11 @@ function initTabs() {
                 item.classList.remove("active");
                 item.setAttribute("aria-selected", "false");
             });
-            document.querySelectorAll(".tab-content").forEach((item) => item.classList.remove("active"));
+
+            document.querySelectorAll(".tab-content").forEach((item) => {
+                item.classList.remove("active");
+            });
+
             button.classList.add("active");
             button.setAttribute("aria-selected", "true");
             $(`#${button.dataset.tab}-tab`).classList.add("active");
@@ -361,8 +436,12 @@ function initTabs() {
 }
 
 function initPromptChips() {
-    document.querySelectorAll("#prompt-chips .chip").forEach((chip) => {
+    const chips = document.querySelectorAll("#prompt-chips .chip");
+
+    chips.forEach((chip) => {
         chip.addEventListener("click", () => {
+            chips.forEach((item) => item.classList.remove("active"));
+            chip.classList.add("active");
             $("#tts-instruct").value = chip.dataset.prompt;
         });
     });
@@ -371,6 +450,7 @@ function initPromptChips() {
 async function init() {
     initTabs();
     initPromptChips();
+
     $("#tts-text").addEventListener("input", updateTtsCounter);
     $("#generate-btn").addEventListener("click", () => requestAudio("mp3"));
     $("#wav-btn").addEventListener("click", () => requestAudio("wav"));
@@ -379,8 +459,10 @@ async function init() {
     $("#generate-book-btn").addEventListener("click", startBookGeneration);
 
     updateTtsCounter();
+
     try {
         await loadMeta();
+        startHealthPolling();
     } catch (error) {
         setStatus($("#tts-status"), `Не удалось загрузить конфигурацию: ${error.message}`, "danger");
         $("#engine-chip").textContent = "Backend недоступен";
@@ -390,6 +472,15 @@ async function init() {
 
 window.addEventListener("beforeunload", () => {
     stopBookPolling();
+
+    if (state.healthPollTimer) {
+        clearInterval(state.healthPollTimer);
+    }
+
+    if (state.streamAbortController) {
+        state.streamAbortController.abort();
+    }
+
     revokeAudioUrl();
 });
 

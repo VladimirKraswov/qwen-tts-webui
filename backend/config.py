@@ -21,11 +21,12 @@ def _env_list(name: str, default: list[str]) -> list[str]:
 
 
 APP_NAME: Final[str] = os.getenv("APP_NAME", "Qwen TTS Web UI")
-APP_VERSION: Final[str] = os.getenv("APP_VERSION", "2.0.0")
+APP_VERSION: Final[str] = os.getenv("APP_VERSION", "2.1.0")
 
 MODEL_NAME: Final[str] = os.getenv("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
 DEVICE: Final[str] = os.getenv("TTS_DEVICE", "cuda:0")
 DTYPE: Final[str] = os.getenv("TTS_DTYPE", "bfloat16")
+
 SAMPLE_RATE: Final[int] = _env_int("TTS_SAMPLE_RATE", 24000)
 STREAM_EMIT_EVERY_FRAMES: Final[int] = _env_int("TTS_STREAM_EMIT_FRAMES", 6)
 STREAM_DECODE_WINDOW_FRAMES: Final[int] = _env_int("TTS_STREAM_DECODE_WINDOW", 72)
@@ -36,12 +37,11 @@ VOICES: Final[list[str]] = _env_list(
     "TTS_VOICES",
     ["Vivian", "Ryan", "Serena", "Aiden", "Eric", "Dylan"],
 )
-
-ALLOWED_AUDIO_FORMATS: Final[set[str]] = {"mp3", "wav", "pcm"}
 SUPPORTED_LANGUAGES: Final[list[str]] = ["Russian", "English", "Chinese", "Auto"]
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR: Final[Path] = Path(__file__).resolve().parent.parent
 FRONTEND_DIR: Final[Path] = BASE_DIR / "frontend"
+
 BOOK_UPLOAD_DIR: Final[Path] = Path(os.getenv("BOOK_UPLOAD_DIR", "/tmp/book_uploads"))
 BOOK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 

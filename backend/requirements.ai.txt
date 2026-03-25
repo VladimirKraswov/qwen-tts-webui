@@ -1,8 +1,13 @@
-transformers==4.46.3
+transformers==4.57.3
+accelerate==1.12.0
+librosa
+soundfile
+sox
+onnxruntime
+einops
 ctranslate2
 faster-whisper
 pyyaml
 pydub
-soundfile
 numpy
 requests
